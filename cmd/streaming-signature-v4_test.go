@@ -20,10 +20,15 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/minio/minio/internal/auth"
+	"github.com/minio/minio/internal/hash/sha256"
 )
 
 // Test read chunk line.
@@ -193,5 +198,59 @@ func TestParseHexUint(t *testing.T) {
 				t.Errorf("parseHexUint(%q) = %v, %v; want %v", tt.in, got, err, tt.want)
 			}
 		}
+	}
+}
+
+func newBenchChunkedReader() *s3ChunkedReader {
+	cr := &s3ChunkedReader{
+		cred:              auth.Credentials{AccessKey: "minioadmin", SecretKey: "minioadmin"},
+		seedSignature:     "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9",
+		seedDate:          time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC),
+		region:            "us-east-1",
+		chunkSHA256Writer: sha256.New(),
+	}
+	cr.initSigning()
+	return cr
+}
+
+// Compare the cached chunk signing against a from-scratch computation,
+// across consecutive chunks so the reused buffers are exercised too.
+func TestChunkSignatureMatchesReference(t *testing.T) {
+	cr := newBenchChunkedReader()
+	for i, chunk := range [][]byte{[]byte("hello world"), bytes.Repeat([]byte{'a'}, 64*1024), nil} {
+		cr.chunkSHA256Writer.Reset()
+		cr.chunkSHA256Writer.Write(chunk)
+		hashedChunk := hex.EncodeToString(cr.chunkSHA256Writer.Sum(nil))
+		signingKey := getSigningKey(cr.cred.SecretKey, cr.seedDate, cr.region, serviceS3)
+		prefix := cr.seedDate.Format(iso8601Format) + "\n" + getScope(cr.seedDate, cr.region) + "\n" + cr.seedSignature + "\n"
+
+		want := getSignature(signingKey, signV4ChunkedAlgorithm+"\n"+prefix+emptySHA256+"\n"+hashedChunk)
+		if got := cr.getChunkSignature(); got != want {
+			t.Fatalf("chunk %d: getChunkSignature() = %s, want %s", i, got, want)
+		}
+		wantTrailer := getSignature(signingKey, signV4ChunkedAlgorithmTrailer+"\n"+prefix+hashedChunk)
+		if got := cr.getTrailerChunkSignature(); got != wantTrailer {
+			t.Fatalf("chunk %d: getTrailerChunkSignature() = %s, want %s", i, got, wantTrailer)
+		}
+		cr.seedSignature = want
+	}
+}
+
+func BenchmarkChunkSignature(b *testing.B) {
+	cr := newBenchChunkedReader()
+	cr.chunkSHA256Writer.Write(make([]byte, 64*1024))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cr.seedSignature = cr.getChunkSignature()
+	}
+}
+
+func BenchmarkTrailerChunkSignature(b *testing.B) {
+	cr := newBenchChunkedReader()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cr.seedSignature = cr.getTrailerChunkSignature()
 	}
 }

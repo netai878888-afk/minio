@@ -22,6 +22,7 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"crypto/hmac"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -49,48 +50,51 @@ const (
 	trailerKVSeparator            = ":"
 )
 
+// initSigning derives the signing key and the date/scope part of the
+// string to sign once per request, since both stay fixed for every chunk.
+func (cr *s3ChunkedReader) initSigning() {
+	signingKey := getSigningKey(cr.cred.SecretKey, cr.seedDate, cr.region, serviceS3)
+	cr.chunkHMAC = hmac.New(sha256.New, signingKey)
+	cr.dateScope = cr.seedDate.Format(iso8601Format) + "\n" + getScope(cr.seedDate, cr.region) + "\n"
+}
+
+// signChunk returns the hex signature of the string to sign
+//
+//	alg + "\n" + date + "\n" + scope + "\n" + seedSignature + "\n" + [emptySHA256 + "\n"] + hashedChunk
+//
+// Does not update anything in cr except reusable scratch buffers.
+func (cr *s3ChunkedReader) signChunk(alg string, withEmptyHash bool) string {
+	var sum [sha256.Size]byte
+	var hashedChunk [2 * sha256.Size]byte
+	hex.Encode(hashedChunk[:], cr.chunkSHA256Writer.Sum(sum[:0]))
+
+	buf := cr.stringToSign[:0]
+	buf = append(buf, alg...)
+	buf = append(buf, '\n')
+	buf = append(buf, cr.dateScope...)
+	buf = append(buf, cr.seedSignature...)
+	buf = append(buf, '\n')
+	if withEmptyHash {
+		buf = append(buf, emptySHA256...)
+		buf = append(buf, '\n')
+	}
+	buf = append(buf, hashedChunk[:]...)
+	cr.stringToSign = buf
+
+	cr.chunkHMAC.Reset()
+	cr.chunkHMAC.Write(buf)
+	return hex.EncodeToString(cr.chunkHMAC.Sum(sum[:0]))
+}
+
 // getChunkSignature - get chunk signature.
 // Does not update anything in cr.
 func (cr *s3ChunkedReader) getChunkSignature() string {
-	hashedChunk := hex.EncodeToString(cr.chunkSHA256Writer.Sum(nil))
-
-	// Calculate string to sign.
-	alg := signV4ChunkedAlgorithm + "\n"
-	stringToSign := alg +
-		cr.seedDate.Format(iso8601Format) + "\n" +
-		getScope(cr.seedDate, cr.region) + "\n" +
-		cr.seedSignature + "\n" +
-		emptySHA256 + "\n" +
-		hashedChunk
-
-	// Get hmac signing key.
-	signingKey := getSigningKey(cr.cred.SecretKey, cr.seedDate, cr.region, serviceS3)
-
-	// Calculate signature.
-	newSignature := getSignature(signingKey, stringToSign)
-
-	return newSignature
+	return cr.signChunk(signV4ChunkedAlgorithm, true)
 }
 
 // getTrailerChunkSignature - get trailer chunk signature.
 func (cr *s3ChunkedReader) getTrailerChunkSignature() string {
-	hashedChunk := hex.EncodeToString(cr.chunkSHA256Writer.Sum(nil))
-
-	// Calculate string to sign.
-	alg := signV4ChunkedAlgorithmTrailer + "\n"
-	stringToSign := alg +
-		cr.seedDate.Format(iso8601Format) + "\n" +
-		getScope(cr.seedDate, cr.region) + "\n" +
-		cr.seedSignature + "\n" +
-		hashedChunk
-
-	// Get hmac signing key.
-	signingKey := getSigningKey(cr.cred.SecretKey, cr.seedDate, cr.region, serviceS3)
-
-	// Calculate signature.
-	newSignature := getSignature(signingKey, stringToSign)
-
-	return newSignature
+	return cr.signChunk(signV4ChunkedAlgorithmTrailer, false)
 }
 
 // calculateSeedSignature - Calculate seed signature in accordance with
@@ -208,7 +212,7 @@ func newSignV4ChunkedReader(req *http.Request, trailer bool) (io.ReadCloser, API
 	} else {
 		req.Trailer = nil
 	}
-	return &s3ChunkedReader{
+	cr := &s3ChunkedReader{
 		trailers:          req.Trailer,
 		reader:            bufio.NewReader(req.Body),
 		cred:              cred,
@@ -218,7 +222,9 @@ func newSignV4ChunkedReader(req *http.Request, trailer bool) (io.ReadCloser, API
 		chunkSHA256Writer: sha256.New(),
 		buffer:            make([]byte, 64*1024),
 		debug:             false,
-	}, ErrNone
+	}
+	cr.initSigning()
+	return cr, ErrNone
 }
 
 // Represents the overall state that is required for decoding a
@@ -232,6 +238,9 @@ type s3ChunkedReader struct {
 	trailers      http.Header
 
 	chunkSHA256Writer hash.Hash // Calculates sha256 of chunk data.
+	chunkHMAC         hash.Hash // HMAC keyed with the request's signing key, reset per chunk.
+	dateScope         string    // "<date>\n<scope>\n" part of every chunk's string to sign.
+	stringToSign      []byte    // Scratch buffer for the chunk string to sign.
 	buffer            []byte
 	offset            int
 	err               error
